@@ -78,6 +78,7 @@ app.post("/nlu", async (req, res) => {
   const BASE = baseUrl(req);
   const from = req.body.From;
   const callSid = req.body.CallSid;
+  console.log("🧾 Twilio request body =", req.body);
   const speech = (req.body.SpeechResult || "").trim();
   const state = callState.get(callSid) || { items: [], started: false };
 
@@ -166,15 +167,21 @@ ${buildSummary(state.items)}`;
     <Say voice="Polly.Celine" language="${LOCALE}">
       ${confirm}${follow}
     </Say>
-    <Gather input="speech"
-            language="${LOCALE}"
-            bargeIn="true"
-            speechTimeout="auto"
-            action="${BASE}/nlu"
-            method="POST"
-            hints="tacos,kebab,pizza,menu,frites,coca,sans oignons,supplément fromage,taille,boisson">
-      <Say voice="Polly.Celine" language="${LOCALE}">Je vous écoute.</Say>
-    </Gather>
+    <Gather 
+  input="speech"
+  language="fr-FR"
+  enhanced="true"
+  speechModel="phone_call"
+  speechTimeout="auto"
+  hints="tacos,kebab,pizza,menu,frites,coca,supplément fromage,sans oignons"
+  bargeIn="true"
+  action="${BASE}/nlu"
+  method="POST">
+  <Say voice="Polly.Celine" language="${LOCALE}">
+    Je vous écoute.
+  </Say>
+</Gather>
+
     <Say voice="Polly.Celine" language="${LOCALE}">Je n'ai pas entendu. Au revoir.</Say>
     <Hangup/>
   `);
@@ -187,3 +194,4 @@ ${buildSummary(state.items)}`;
 app.listen(PORT, () => {
   console.log(`✅ Voice AI conversationnel live on ${PORT}`);
 });
+
