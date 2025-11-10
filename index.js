@@ -1,197 +1,218 @@
-// Assistant vocal conversationnel (speech only) + SMS récap
-// - Voix naturelle : Polly.Celine (FR)
-// - Pas de touches, barge-in = true, speechTimeout = auto
-// - Mémoire courte par appel (CallSid) pour accumuler les items
-// - Envoi d'un SMS récapitulatif quand le client dit "c'est tout / c'est bon / terminé"
-
+// Voice AI hybrid: Twilio STT first, fallback to Whisper if needed
 import express from "express";
+import axios from "axios";
 import Twilio from "twilio";
 import OpenAI from "openai";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const LOCALE = process.env.LOCALE || "fr-FR";
-const SMS_FROM = process.env.TWILIO_SMS_FROM;
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const LOCALE = process.env.LOCALE || "fr-FR";
+const BASE = process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") || `http://localhost:${PORT}`;
+const SMS_FROM = process.env.TWILIO_SMS_FROM || "";
 
 // Twilio envoie du x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-// État minimal par appel (mémoire RAM, ok pour démo)
-const callState = new Map(); // key: CallSid -> { items: [{name, quantity, notes}], started: bool }
-
-// Helpers
 const twiml = (inner) => `<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`;
-const buildSummary = (items = []) =>
-  items.length
-    ? items.map(i => `• ${i.quantity || 1} x ${i.name}${i.notes ? ` (${i.notes})` : ""}`).join("\n")
-    : "Aucune ligne pour l’instant.";
+const sayTag = (text) => `<Say voice="alice" language="${LOCALE}">${text}</Say>`;
 
-function baseUrl(req) {
-  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
-  const host = req.get("host");
-  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
-  return `${proto}://${host}`;
-}
-
-// Sémantique "fin de commande"
-const DONE_RE = /\b(c'?est (tout|bon)|termin(é|ee)|ça suffit|non merci|pas (autre|autre chose)|rien d'autre)\b/i;
-
-// Santé
-app.get("/", (req, res) => res.send("✅ Voice AI conversationnel en ligne"));
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 1) Entrée d'appel : message d'accueil + Gather (speech only)
-// ───────────────────────────────────────────────────────────────────────────────
-app.post("/voice", (req, res) => {
-  const BASE = baseUrl(req);
-  const callSid = req.body.CallSid;
-  if (!callState.has(callSid)) callState.set(callSid, { items: [], started: true });
-
-  const xml = twiml(`
-    <Say voice="Polly.Celine" language="${LOCALE}">
-      Bonjour ! Dites-moi votre commande quand vous voulez, je vous écoute.
-    </Say>
-    <Gather input="speech"
-            language="${LOCALE}"
-            bargeIn="true"
-            speechTimeout="auto"
-            action="${BASE}/nlu"
-            method="POST"
-            hints="tacos,kebab,pizza,menu,frites,coca,sans oignons,supplément fromage,taille,boisson">
-      <Say voice="Polly.Celine" language="${LOCALE}">
-        Vous pouvez parler maintenant.
-      </Say>
-    </Gather>
-    <Say voice="Polly.Celine" language="${LOCALE}">Je n'ai pas entendu. Au revoir.</Say>
-    <Hangup/>
-  `);
-  res.type("text/xml").send(xml);
-});
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 2) Compréhension + gestion du tour de parole -> confirmation/relance
-// ───────────────────────────────────────────────────────────────────────────────
-app.post("/nlu", async (req, res) => {
-  const BASE = baseUrl(req);
-  const from = req.body.From;
-  const callSid = req.body.CallSid;
-  console.log("🧾 Twilio request body =", req.body);
-  const speech = (req.body.SpeechResult || "").trim();
-  const state = callState.get(callSid) || { items: [], started: false };
-
-  console.log("🗣️ SpeechResult:", speech);
-
-  // Si l'utilisateur dit "c'est tout" & on a des items -> envoyer SMS + raccrocher
-  if (DONE_RE.test(speech) && state.items.length) {
-    const recap = `Récapitulatif de votre commande :\n${buildSummary(state.items)}`;
-    if (SMS_FROM && from) {
-      try {
-        const msg = await client.messages.create({ from: SMS_FROM, to: from, body: recap });
-        console.log("📩 SMS envoyé:", msg.sid);
-      } catch (e) {
-        console.error("❌ Erreur envoi SMS:", e?.message || e);
-      }
-    } else {
-      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)");
-    }
-    callState.delete(callSid);
-    const xml = twiml(`
-      <Say voice="Polly.Celine" language="${LOCALE}">
-        Parfait ! Je vous envoie un SMS récapitulatif. Merci, à bientôt.
-      </Say>
-      <Hangup/>
-    `);
-    return res.type("text/xml").send(xml);
-  }
-
-  // Appel à l'IA pour parser la commande (items + éventuelle relance)
-  let parsed = { items: [], followup: "" };
-  try {
-    const system = `Tu es un assistant de prise de commande de restauration rapide par téléphone.
-Retourne STRICTEMENT un JSON valide, sans texte autour, comme :
+// ---------- Helpers ----------
+async function parseOrderFromText(text) {
+  const system = `Tu es un assistant de prise de commande de restauration rapide.
+Retourne STRICTEMENT un JSON valide, sans texte autour, suivant ce schéma:
 {
   "items":[{"name":"string","quantity":number,"notes":"string"}],
-  "followup":"string courte en français ou vide"
+  "intent":"order",
+  "summary":"string courte en français"
 }
-Règles :
-- Corrige les noms de plats si besoin (français).
-- Si quantité absente => 1.
-- notes peut contenir "sans oignons", "supplément fromage", "boisson grande", etc.
-- Si le message n'est pas une commande claire, renvoie items=[] et une followup polie pour demander une précision.`;
+- Déduis la quantité si elle n'est pas dite explicitement (par défaut 1).
+- "notes" peut être vide si aucune précision.`;
 
-    const user = `Client: """${speech}"""
-Contexte actuel:
-${buildSummary(state.items)}`;
+  const user = `Transcript client (français) : """${text}"""`;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      response_format: { type: "json_object" },
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ],
-      max_completion_tokens: 400
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.2,
+    max_completion_tokens: 400,
+  });
+
+  try {
+    return JSON.parse(completion.choices[0].message.content);
+  } catch {
+    return { items: [], intent: "order", summary: text || "Commande non comprise" };
+  }
+}
+
+function orderToSms(parsed, fallbackText) {
+  const lines = (parsed.items || []).map(
+    (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " (" + it.notes + ")" : ""}`
+  );
+  if (lines.length) {
+    return `Récapitulatif de votre commande :\n${lines.join("\n")}\n\n${parsed.summary || ""}`;
+  }
+  return `Nous avons bien reçu votre message :\n"${fallbackText}"\n(Nous reviendrons vers vous si besoin)`;
+}
+
+async function sendSms(to, body) {
+  if (!SMS_FROM || !to) {
+    console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou numéro 'to' manquant)");
+    return;
+  }
+  await client.messages.create({ from: SMS_FROM, to, body });
+  console.log("📩 SMS envoyé à", to);
+}
+
+// ---------- Routes ----------
+
+// Santé
+app.get("/", (_req, res) => res.send("✅ Voice AI hybrid server running"));
+
+// 1) Accueil + Gather (reconnaissance Twilio)
+//    actionOnEmptyResult="true" -> on reçoit /nlu même si rien n'est compris
+app.all("/voice", (_req, res) => {
+  res.type("text/xml").send(
+    twiml(`
+      ${sayTag(
+        `Bienvenue. Dites simplement votre commande quand vous êtes prêt. 
+         Par exemple : "Deux tacos bœuf, une pizza 4 fromages et un coca zéro".`
+      )}
+      <Gather
+        input="speech"
+        language="fr-FR"
+        enhanced="true"
+        speechModel="phone_call"
+        speechTimeout="auto"
+        hints="tacos,kebab,pizza,menu,frites,coca,supplément,fromage,sans oignons,boisson"
+        bargeIn="true"
+        action="${BASE}/nlu"
+        actionOnEmptyResult="true"
+        method="POST">
+        ${sayTag("Je vous écoute.")}
+      </Gather>
+      ${sayTag("Je n'ai pas entendu. Laissez un message après le bip.")}
+      <Redirect method="POST">${BASE}/record</Redirect>
+    `)
+  );
+});
+
+// 2) Traitement du résultat de Twilio STT
+app.post("/nlu", async (req, res) => {
+  console.log("🧾 Twilio body @/nlu =", req.body);
+  const from = req.body.From;
+  const speech = (req.body.SpeechResult || "").trim();
+  console.log("🗣️ SpeechResult =", speech);
+
+  // Si Twilio n'a rien compris -> bascule vers enregistrement
+  if (!speech || speech.length < 3) {
+    return res.type("text/xml").send(
+      twiml(`
+        ${sayTag("Pardon, ce n'était pas clair. Laissez votre commande après le bip.")}
+        <Redirect method="POST">${BASE}/record</Redirect>
+      `)
+    );
+  }
+
+  try {
+    const parsed = await parseOrderFromText(speech);
+    const sms = orderToSms(parsed, speech);
+
+    // Confirmation vocale + envoi SMS (asynchrone non bloquant)
+    sendSms(from, sms).catch((e) => console.error("SMS error:", e.message));
+
+    return res.type("text/xml").send(
+      twiml(`
+        ${sayTag("Merci, j'ai bien noté votre commande. Je vous envoie un récapitulatif par SMS.")}
+        <Hangup/>
+      `)
+    );
+  } catch (err) {
+    console.error("❌ NLU error:", err.message);
+    return res.type("text/xml").send(
+      twiml(`
+        ${sayTag("Petit souci de traitement. Laissez votre commande après le bip.")}
+        <Redirect method="POST">${BASE}/record</Redirect>
+      `)
+    );
+  }
+});
+
+// 3) Démarrage du mode enregistrement (fallback)
+app.post("/record", (_req, res) => {
+  res.type("text/xml").send(
+    twiml(`
+      <Record
+        playBeep="true"
+        finishOnKey="#"
+        maxLength="90"
+        action="${BASE}/thanks"
+        recordingStatusCallback="${BASE}/recording-done"
+        recordingStatusCallbackMethod="POST"/>
+      ${sayTag("Je n'ai rien reçu. Au revoir.")}
+      <Hangup/>
+    `)
+  );
+});
+
+// 4) Retour direct au client (rapide, pendant que l'ASR tourne en fond)
+app.post("/thanks", (_req, res) => {
+  res.type("text/xml").send(
+    twiml(`
+      ${sayTag("Merci ! Nous traitons votre message et vous enverrons un SMS.")}
+      <Hangup/>
+    `)
+  );
+});
+
+// 5) Callback quand l'enregistrement est prêt -> on télécharge → Whisper → GPT → SMS
+app.post("/recording-done", async (req, res) => {
+  res.status(200).send("OK"); // répondre vite à Twilio
+  try {
+    const from = req.body.From;
+    const recUrlBase = req.body.RecordingUrl; // sans extension
+    const recUrl = `${recUrlBase}.mp3`;
+    console.log("🎙️ recording url =", recUrl);
+
+    // Télécharger l'audio depuis Twilio (auth basique SID/TOKEN)
+    const audioStream = await axios.get(recUrl, {
+      responseType: "stream",
+      auth: {
+        username: process.env.TWILIO_ACCOUNT_SID,
+        password: process.env.TWILIO_AUTH_TOKEN,
+      },
     });
 
-    parsed = JSON.parse(completion.choices[0].message.content);
+    // Whisper
+    const transcription = await openai.audio.transcriptions.create({
+      file: audioStream.data,
+      model: "whisper-1",
+    });
+    const text = (transcription?.text || "").trim();
+    console.log("📝 Whisper text =", text);
+
+    if (!text) return console.warn("⚠️ Whisper vide");
+
+    // GPT extraction
+    const parsed = await parseOrderFromText(text);
+    const sms = orderToSms(parsed, text);
+
+    // SMS
+    await sendSms(from, sms);
   } catch (e) {
-    console.error("❌ NLU error:", e?.message || e);
-    parsed = { items: [], followup: "Je n'ai pas bien compris. Pourriez-vous formuler votre commande à nouveau, s'il vous plaît ?" };
+    console.error("❌ recording-done error:", e.response?.data || e.message);
   }
-
-  // Met à jour l'état avec les nouveaux items
-  if (Array.isArray(parsed.items) && parsed.items.length) {
-    state.items.push(...parsed.items.map(it => ({
-      name: it.name,
-      quantity: it.quantity || 1,
-      notes: it.notes || ""
-    })));
-  }
-  callState.set(callSid, state);
-
-  // Construction du message vocal (confirmation + relance)
-  const confirm = state.items.length
-    ? `J'ai noté : ${state.items.map(i => `${i.quantity || 1} ${i.name}${i.notes ? ` (${i.notes})` : ""}`).join(", ")}. `
-    : "";
-
-  const follow = (parsed.followup && parsed.followup.trim())
-    ? parsed.followup.trim()
-    : "Souhaitez-vous autre chose, ou je récapitule ? Vous pouvez dire : c'est tout.";
-
-  // Reboucle un Gather pour continuer naturellement
-  const xml = twiml(`
-    <Say voice="Polly.Celine" language="${LOCALE}">
-      ${confirm}${follow}
-    </Say>
-    <Gather 
-  input="speech"
-  language="fr-FR"
-  enhanced="true"
-  speechModel="phone_call"
-  speechTimeout="auto"
-  hints="tacos,kebab,pizza,menu,frites,coca,supplément fromage,sans oignons"
-  bargeIn="true"
-  action="${BASE}/nlu"
-  method="POST">
-  <Say voice="Polly.Celine" language="${LOCALE}">
-    Je vous écoute.
-  </Say>
-</Gather>
-
-    <Say voice="Polly.Celine" language="${LOCALE}">Je n'ai pas entendu. Au revoir.</Say>
-    <Hangup/>
-  `);
-
-  res.type("text/xml").send(xml);
 });
 
-// ───────────────────────────────────────────────────────────────────────────────
-
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`✅ Voice AI conversationnel live on ${PORT}`);
+  console.log(`✅ Voice AI hybrid live on ${PORT}`);
+  console.log(`➡️ Base URL: ${BASE}`);
 });
-
