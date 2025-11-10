@@ -1,5 +1,5 @@
 {
-  "name": "twilio-voice-test",
+  "name": "twilio-voice-ai",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
@@ -7,6 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "axios": "^1.7.7",
+    "express": "^4.19.2",
+    "twilio": "^4.21.0",
+    "openai": "^4.56.0"
   }
 }
