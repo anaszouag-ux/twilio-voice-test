@@ -1,218 +1,98 @@
-// Voice AI hybrid: Twilio STT first, fallback to Whisper if needed
+// index.js — Flux 100% Twilio : prise de commande vocale + SMS récap, sans OpenAI
+
 import express from "express";
-import axios from "axios";
 import Twilio from "twilio";
-import OpenAI from "openai";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ENV attendus : TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM, LOCALE (facultatif)
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 const LOCALE = process.env.LOCALE || "fr-FR";
-const BASE = process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") || `http://localhost:${PORT}`;
-const SMS_FROM = process.env.TWILIO_SMS_FROM || "";
+const SMS_FROM = process.env.TWILIO_SMS_FROM;
 
-// Twilio envoie du x-www-form-urlencoded
+// Twilio envoie les webhooks en x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-const twiml = (inner) => `<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`;
-const sayTag = (text) => `<Say voice="alice" language="${LOCALE}">${text}</Say>`;
+const twiml = (xml) => `<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`;
 
-// ---------- Helpers ----------
-async function parseOrderFromText(text) {
-  const system = `Tu es un assistant de prise de commande de restauration rapide.
-Retourne STRICTEMENT un JSON valide, sans texte autour, suivant ce schéma:
-{
-  "items":[{"name":"string","quantity":number,"notes":"string"}],
-  "intent":"order",
-  "summary":"string courte en français"
-}
-- Déduis la quantité si elle n'est pas dite explicitement (par défaut 1).
-- "notes" peut être vide si aucune précision.`;
+app.get("/", (req, res) => res.send("✅ Voice AI (Twilio-only) running"));
 
-  const user = `Transcript client (français) : """${text}"""`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    response_format: { type: "json_object" },
-    temperature: 0.2,
-    max_completion_tokens: 400,
-  });
-
-  try {
-    return JSON.parse(completion.choices[0].message.content);
-  } catch {
-    return { items: [], intent: "order", summary: text || "Commande non comprise" };
-  }
-}
-
-function orderToSms(parsed, fallbackText) {
-  const lines = (parsed.items || []).map(
-    (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " (" + it.notes + ")" : ""}`
-  );
-  if (lines.length) {
-    return `Récapitulatif de votre commande :\n${lines.join("\n")}\n\n${parsed.summary || ""}`;
-  }
-  return `Nous avons bien reçu votre message :\n"${fallbackText}"\n(Nous reviendrons vers vous si besoin)`;
-}
-
-async function sendSms(to, body) {
-  if (!SMS_FROM || !to) {
-    console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou numéro 'to' manquant)");
-    return;
-  }
-  await client.messages.create({ from: SMS_FROM, to, body });
-  console.log("📩 SMS envoyé à", to);
-}
-
-// ---------- Routes ----------
-
-// Santé
-app.get("/", (_req, res) => res.send("✅ Voice AI hybrid server running"));
-
-// 1) Accueil + Gather (reconnaissance Twilio)
-//    actionOnEmptyResult="true" -> on reçoit /nlu même si rien n'est compris
-app.all("/voice", (_req, res) => {
+/**
+ * 1) Accueil + <Gather input="speech"> pour capter la commande
+ * - Twilio fera la STT côté plate-forme et renverra SpeechResult à /process
+ */
+app.all("/voice", (req, res) => {
   res.type("text/xml").send(
     twiml(`
-      ${sayTag(
-        `Bienvenue. Dites simplement votre commande quand vous êtes prêt. 
-         Par exemple : "Deux tacos bœuf, une pizza 4 fromages et un coca zéro".`
-      )}
-      <Gather
-        input="speech"
-        language="fr-FR"
-        enhanced="true"
-        speechModel="phone_call"
-        speechTimeout="auto"
-        hints="tacos,kebab,pizza,menu,frites,coca,supplément,fromage,sans oignons,boisson"
-        bargeIn="true"
-        action="${BASE}/nlu"
-        actionOnEmptyResult="true"
-        method="POST">
-        ${sayTag("Je vous écoute.")}
+      <Gather input="speech"
+              language="${LOCALE}"
+              speechTimeout="auto"
+              action="/process"
+              method="POST">
+        <Say voice="alice" language="${LOCALE}">
+          Bonjour ! Dites votre commande après le bip. 
+          Par exemple : deux tacos bœuf, une pizza quatre fromages, et un coca zéro.
+          Quand vous avez terminé, dites simplement "c'est tout".
+        </Say>
+        <Pause length="1"/>
       </Gather>
-      ${sayTag("Je n'ai pas entendu. Laissez un message après le bip.")}
-      <Redirect method="POST">${BASE}/record</Redirect>
+      <Say voice="alice" language="${LOCALE}">
+        Pardon, je n'ai rien entendu. Je vous invite à rappeler.
+      </Say>
+      <Hangup/>
     `)
   );
 });
 
-// 2) Traitement du résultat de Twilio STT
-app.post("/nlu", async (req, res) => {
-  console.log("🧾 Twilio body @/nlu =", req.body);
-  const from = req.body.From;
+/**
+ * 2) Réception du résultat STT de Twilio -> SMS au client et confirmation vocale
+ */
+app.post("/process", async (req, res) => {
   const speech = (req.body.SpeechResult || "").trim();
-  console.log("🗣️ SpeechResult =", speech);
+  const from = req.body.From;
 
-  // Si Twilio n'a rien compris -> bascule vers enregistrement
-  if (!speech || speech.length < 3) {
+  // Si Twilio n'a rien compris, on redemande une fois
+  if (!speech) {
     return res.type("text/xml").send(
       twiml(`
-        ${sayTag("Pardon, ce n'était pas clair. Laissez votre commande après le bip.")}
-        <Redirect method="POST">${BASE}/record</Redirect>
+        <Say voice="alice" language="${LOCALE}">
+          Désolé, je n'ai pas compris. Pouvez-vous répéter votre commande ?
+        </Say>
+        <Redirect method="POST">/voice</Redirect>
       `)
     );
   }
 
+  // Message SMS à envoyer au client
+  const smsBody =
+    `Récap de votre commande :\n` +
+    `"${speech}"\n\n` +
+    `Si c'est correct, aucun retour n'est nécessaire. Merci !`;
+
+  // On tente d'envoyer le SMS (si la config SMS est OK)
   try {
-    const parsed = await parseOrderFromText(speech);
-    const sms = orderToSms(parsed, speech);
-
-    // Confirmation vocale + envoi SMS (asynchrone non bloquant)
-    sendSms(from, sms).catch((e) => console.error("SMS error:", e.message));
-
-    return res.type("text/xml").send(
-      twiml(`
-        ${sayTag("Merci, j'ai bien noté votre commande. Je vous envoie un récapitulatif par SMS.")}
-        <Hangup/>
-      `)
-    );
-  } catch (err) {
-    console.error("❌ NLU error:", err.message);
-    return res.type("text/xml").send(
-      twiml(`
-        ${sayTag("Petit souci de traitement. Laissez votre commande après le bip.")}
-        <Redirect method="POST">${BASE}/record</Redirect>
-      `)
-    );
-  }
-});
-
-// 3) Démarrage du mode enregistrement (fallback)
-app.post("/record", (_req, res) => {
-  res.type("text/xml").send(
-    twiml(`
-      <Record
-        playBeep="true"
-        finishOnKey="#"
-        maxLength="90"
-        action="${BASE}/thanks"
-        recordingStatusCallback="${BASE}/recording-done"
-        recordingStatusCallbackMethod="POST"/>
-      ${sayTag("Je n'ai rien reçu. Au revoir.")}
-      <Hangup/>
-    `)
-  );
-});
-
-// 4) Retour direct au client (rapide, pendant que l'ASR tourne en fond)
-app.post("/thanks", (_req, res) => {
-  res.type("text/xml").send(
-    twiml(`
-      ${sayTag("Merci ! Nous traitons votre message et vous enverrons un SMS.")}
-      <Hangup/>
-    `)
-  );
-});
-
-// 5) Callback quand l'enregistrement est prêt -> on télécharge → Whisper → GPT → SMS
-app.post("/recording-done", async (req, res) => {
-  res.status(200).send("OK"); // répondre vite à Twilio
-  try {
-    const from = req.body.From;
-    const recUrlBase = req.body.RecordingUrl; // sans extension
-    const recUrl = `${recUrlBase}.mp3`;
-    console.log("🎙️ recording url =", recUrl);
-
-    // Télécharger l'audio depuis Twilio (auth basique SID/TOKEN)
-    const audioStream = await axios.get(recUrl, {
-      responseType: "stream",
-      auth: {
-        username: process.env.TWILIO_ACCOUNT_SID,
-        password: process.env.TWILIO_AUTH_TOKEN,
-      },
-    });
-
-    // Whisper
-    const transcription = await openai.audio.transcriptions.create({
-      file: audioStream.data,
-      model: "whisper-1",
-    });
-    const text = (transcription?.text || "").trim();
-    console.log("📝 Whisper text =", text);
-
-    if (!text) return console.warn("⚠️ Whisper vide");
-
-    // GPT extraction
-    const parsed = await parseOrderFromText(text);
-    const sms = orderToSms(parsed, text);
-
-    // SMS
-    await sendSms(from, sms);
+    if (SMS_FROM && from) {
+      await client.messages.create({ from: SMS_FROM, to: from, body: smsBody });
+      console.log("📩 SMS envoyé à", from, "=>", smsBody);
+    } else {
+      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)");
+    }
   } catch (e) {
-    console.error("❌ recording-done error:", e.response?.data || e.message);
+    console.error("❌ Erreur envoi SMS:", e?.message || e);
   }
+
+  // Confirmation à l'appelant + on répète ce qu'on a compris
+  res.type("text/xml").send(
+    twiml(`
+      <Say voice="alice" language="${LOCALE}">
+        Merci. J'ai bien noté : ${speech}.
+        Vous allez recevoir un SMS récapitulatif.
+        Bonne journée !
+      </Say>
+      <Hangup/>
+    `)
+  );
 });
 
-// ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`✅ Voice AI hybrid live on ${PORT}`);
-  console.log(`➡️ Base URL: ${BASE}`);
-});
+app.listen(PORT, () => console.log(`✅ Voice AI (Twilio-only) live on ${PORT}`));
