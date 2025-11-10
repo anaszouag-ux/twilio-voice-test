@@ -1,173 +1,189 @@
-// Appel -> enregistrement -> callback de traitement -> SMS au client
+// Assistant vocal conversationnel (speech only) + SMS récap
+// - Voix naturelle : Polly.Celine (FR)
+// - Pas de touches, barge-in = true, speechTimeout = auto
+// - Mémoire courte par appel (CallSid) pour accumuler les items
+// - Envoi d'un SMS récapitulatif quand le client dit "c'est tout / c'est bon / terminé"
+
 import express from "express";
-import axios from "axios";
 import Twilio from "twilio";
 import OpenAI from "openai";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const LOCALE = process.env.LOCALE || "fr-FR";
+const SMS_FROM = process.env.TWILIO_SMS_FROM;
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const LOCALE = process.env.LOCALE || "fr-FR";
-const SMS_FROM = process.env.TWILIO_SMS_FROM;
-const BASE = process.env.PUBLIC_BASE_URL?.replace(/\/$/, ""); // ex: https://twilio-voice-test-xxxxx.onrender.com
-
-// Twilio poste en x-www-form-urlencoded
+// Twilio envoie du x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-const twiml = (xml) => `<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`;
+// État minimal par appel (mémoire RAM, ok pour démo)
+const callState = new Map(); // key: CallSid -> { items: [{name, quantity, notes}], started: bool }
+
+// Helpers
+const twiml = (inner) => `<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`;
+const buildSummary = (items = []) =>
+  items.length
+    ? items.map(i => `• ${i.quantity || 1} x ${i.name}${i.notes ? ` (${i.notes})` : ""}`).join("\n")
+    : "Aucune ligne pour l’instant.";
+
+function baseUrl(req) {
+  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
+  const host = req.get("host");
+  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
+  return `${proto}://${host}`;
+}
+
+// Sémantique "fin de commande"
+const DONE_RE = /\b(c'?est (tout|bon)|termin(é|ee)|ça suffit|non merci|pas (autre|autre chose)|rien d'autre)\b/i;
 
 // Santé
-app.get("/", (req, res) => res.send("✅ Voice AI server running"));
+app.get("/", (req, res) => res.send("✅ Voice AI conversationnel en ligne"));
 
-// 1) Entrée d'appel : on donne la consigne et on enregistre
-app.all("/voice", (req, res) => {
-  console.log("📞 /voice hit. From:", req.body?.From);
-  if (!BASE) console.warn("⚠️ PUBLIC_BASE_URL manquant : ajoute-le dans Render !");
-  const thanksUrl = `${BASE}/thanks`;
-  const recCbUrl  = `${BASE}/recording-done`;
+// ───────────────────────────────────────────────────────────────────────────────
+// 1) Entrée d'appel : message d'accueil + Gather (speech only)
+// ───────────────────────────────────────────────────────────────────────────────
+app.post("/voice", (req, res) => {
+  const BASE = baseUrl(req);
+  const callSid = req.body.CallSid;
+  if (!callState.has(callSid)) callState.set(callSid, { items: [], started: true });
 
-  res.type("text/xml").send(
-    twiml(`
-      <Say voice="alice" language="${LOCALE}">
-        Bienvenue. Après le bip, dictez votre commande (par exemple :
-        "Deux tacos bœuf, une pizza 4 fromages, et un coca zéro").
-        Appuyez sur dièse pour terminer.
+  const xml = twiml(`
+    <Say voice="Polly.Celine" language="${LOCALE}">
+      Bonjour ! Dites-moi votre commande quand vous voulez, je vous écoute.
+    </Say>
+    <Gather input="speech"
+            language="${LOCALE}"
+            bargeIn="true"
+            speechTimeout="auto"
+            action="${BASE}/nlu"
+            method="POST"
+            hints="tacos,kebab,pizza,menu,frites,coca,sans oignons,supplément fromage,taille,boisson">
+      <Say voice="Polly.Celine" language="${LOCALE}">
+        Vous pouvez parler maintenant.
       </Say>
-      <Record
-        playBeep="true"
-        finishOnKey="#"
-        maxLength="90"
-        action="${thanksUrl}"
-        method="POST"
-        recordingStatusCallback="${recCbUrl}"
-        recordingStatusCallbackMethod="POST"
-      />
-      <Say voice="alice" language="${LOCALE}">Je n'ai rien reçu.</Say>
-      <Hangup/>
-    `)
-  );
+    </Gather>
+    <Say voice="Polly.Celine" language="${LOCALE}">Je n'ai pas entendu. Au revoir.</Say>
+    <Hangup/>
+  `);
+  res.type("text/xml").send(xml);
 });
 
-// 2) On remercie immédiatement l'appelant (réponse rapide TwiML)
-app.post("/thanks", (req, res) => {
-  console.log("🙏 /thanks hit. From:", req.body?.From, "RecordingUrl:", req.body?.RecordingUrl);
-  res.type("text/xml").send(
-    twiml(`
-      <Say voice="alice" language="${LOCALE}">
-        Merci ! Nous préparons votre commande et nous vous envoyons un récapitulatif par SMS.
-      </Say>
-      <Hangup/>
-    `)
-  );
-});
+// ───────────────────────────────────────────────────────────────────────────────
+// 2) Compréhension + gestion du tour de parole -> confirmation/relance
+// ───────────────────────────────────────────────────────────────────────────────
+app.post("/nlu", async (req, res) => {
+  const BASE = baseUrl(req);
+  const from = req.body.From;
+  const callSid = req.body.CallSid;
+  const speech = (req.body.SpeechResult || "").trim();
+  const state = callState.get(callSid) || { items: [], started: false };
 
-// 3) Callback Twilio quand l'enregistrement est prêt -> on traite en BACK-END
-app.post("/recording-done", async (req, res) => {
-  // Toujours répondre vite à Twilio
-  res.status(200).send("OK");
+  console.log("🗣️ SpeechResult:", speech);
 
-  const from = req.body?.From;
-  const recUrlBase = req.body?.RecordingUrl;
-  const recUrl = recUrlBase ? `${recUrlBase}.mp3` : null;
-
-  console.log("🎧 /recording-done hit. From:", from, "RecordingUrl:", recUrlBase);
-
-  // Si quoi que ce soit cloche, on envoie quand même un SMS générique
-  async function safeSms(body) {
-    if (!SMS_FROM || !from) {
-      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)", { SMS_FROM, from });
-      return;
-    }
-    try {
-      const msg = await client.messages.create({ from: SMS_FROM, to: from, body });
-      console.log("📩 SMS envoyé:", msg.sid);
-    } catch (e) {
-      console.error("❌ Erreur envoi SMS:", e?.message || e);
-    }
-  }
-
-  try {
-    if (!recUrl) {
-      await safeSms("Nous avons bien reçu votre appel. Impossible de récupérer l’enregistrement, nous vous recontacterons si besoin.");
-      return;
-    }
-
-    // 3a) Télécharger l'audio de Twilio (avec auth SID/TOKEN)
-    const audioResponse = await axios.get(recUrl, {
-      responseType: "stream",
-      auth: {
-        username: process.env.TWILIO_ACCOUNT_SID,
-        password: process.env.TWILIO_AUTH_TOKEN,
-      },
-    });
-
-    // 3b) Transcription Whisper
-    let text = "";
-    try {
-      const transcription = await openai.audio.transcriptions.create({
-        file: audioResponse.data, // Readable stream
-        model: "whisper-1",
-      });
-      text = (transcription?.text || "").trim();
-    } catch (err) {
-      console.error("❌ Erreur Whisper:", err?.response?.data || err.message);
-    }
-    console.log("📝 Transcription =", text);
-
-    // 3c) Extraction structurée avec GPT (si on a du texte)
-    let smsBody = "";
-    if (text) {
-      const system = `Tu es un assistant de prise de commande de restauration rapide.
-Retourne STRICTEMENT un JSON valide, sans texte autour, suivant ce schéma :
-{
-  "items":[{"name":"string","quantity":number,"notes":"string"}],
-  "intent":"order",
-  "summary":"string courte en français"
-}
-- Déduis la quantité si elle n'est pas dite explicitement (par défaut 1).
-- "notes" peut être vide si aucune précision.`;
-
-      const user = `Transcript client (français) : """${text}"""`;
-
-      let parsed = null;
+  // Si l'utilisateur dit "c'est tout" & on a des items -> envoyer SMS + raccrocher
+  if (DONE_RE.test(speech) && state.items.length) {
+    const recap = `Récapitulatif de votre commande :\n${buildSummary(state.items)}`;
+    if (SMS_FROM && from) {
       try {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ],
-          response_format: { type: "json_object" },
-          temperature: 0.2,
-          max_completion_tokens: 400,
-        });
-        parsed = JSON.parse(completion.choices[0].message.content);
-      } catch (err) {
-        console.error("❌ Erreur parsing JSON GPT:", err?.message || err);
-      }
-
-      if (parsed?.items?.length) {
-        const lines = parsed.items.map(
-          (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " (" + it.notes + ")" : ""}`
-        );
-        smsBody = `Récapitulatif de votre commande :\n${lines.join("\n")}\n\n${parsed.summary || ""}`;
-      } else {
-        smsBody = `Nous avons bien reçu votre message :\n"${text}"\n(Nous reviendrons vers vous si besoin)`;
+        const msg = await client.messages.create({ from: SMS_FROM, to: from, body: recap });
+        console.log("📩 SMS envoyé:", msg.sid);
+      } catch (e) {
+        console.error("❌ Erreur envoi SMS:", e?.message || e);
       }
     } else {
-      smsBody = "Nous avons bien reçu votre appel, mais la transcription a échoué. Nous vous recontacterons si besoin.";
+      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)");
     }
-
-    // 3d) Envoi SMS (toujours)
-    await safeSms(smsBody);
-
-  } catch (err) {
-    console.error("❌ Erreur traitement callback:", err?.response?.data || err.message);
-    await safeSms("Nous avons bien reçu votre appel. Un incident technique est survenu pendant le traitement.");
+    callState.delete(callSid);
+    const xml = twiml(`
+      <Say voice="Polly.Celine" language="${LOCALE}">
+        Parfait ! Je vous envoie un SMS récapitulatif. Merci, à bientôt.
+      </Say>
+      <Hangup/>
+    `);
+    return res.type("text/xml").send(xml);
   }
+
+  // Appel à l'IA pour parser la commande (items + éventuelle relance)
+  let parsed = { items: [], followup: "" };
+  try {
+    const system = `Tu es un assistant de prise de commande de restauration rapide par téléphone.
+Retourne STRICTEMENT un JSON valide, sans texte autour, comme :
+{
+  "items":[{"name":"string","quantity":number,"notes":"string"}],
+  "followup":"string courte en français ou vide"
+}
+Règles :
+- Corrige les noms de plats si besoin (français).
+- Si quantité absente => 1.
+- notes peut contenir "sans oignons", "supplément fromage", "boisson grande", etc.
+- Si le message n'est pas une commande claire, renvoie items=[] et une followup polie pour demander une précision.`;
+
+    const user = `Client: """${speech}"""
+Contexte actuel:
+${buildSummary(state.items)}`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ],
+      max_completion_tokens: 400
+    });
+
+    parsed = JSON.parse(completion.choices[0].message.content);
+  } catch (e) {
+    console.error("❌ NLU error:", e?.message || e);
+    parsed = { items: [], followup: "Je n'ai pas bien compris. Pourriez-vous formuler votre commande à nouveau, s'il vous plaît ?" };
+  }
+
+  // Met à jour l'état avec les nouveaux items
+  if (Array.isArray(parsed.items) && parsed.items.length) {
+    state.items.push(...parsed.items.map(it => ({
+      name: it.name,
+      quantity: it.quantity || 1,
+      notes: it.notes || ""
+    })));
+  }
+  callState.set(callSid, state);
+
+  // Construction du message vocal (confirmation + relance)
+  const confirm = state.items.length
+    ? `J'ai noté : ${state.items.map(i => `${i.quantity || 1} ${i.name}${i.notes ? ` (${i.notes})` : ""}`).join(", ")}. `
+    : "";
+
+  const follow = (parsed.followup && parsed.followup.trim())
+    ? parsed.followup.trim()
+    : "Souhaitez-vous autre chose, ou je récapitule ? Vous pouvez dire : c'est tout.";
+
+  // Reboucle un Gather pour continuer naturellement
+  const xml = twiml(`
+    <Say voice="Polly.Celine" language="${LOCALE}">
+      ${confirm}${follow}
+    </Say>
+    <Gather input="speech"
+            language="${LOCALE}"
+            bargeIn="true"
+            speechTimeout="auto"
+            action="${BASE}/nlu"
+            method="POST"
+            hints="tacos,kebab,pizza,menu,frites,coca,sans oignons,supplément fromage,taille,boisson">
+      <Say voice="Polly.Celine" language="${LOCALE}">Je vous écoute.</Say>
+    </Gather>
+    <Say voice="Polly.Celine" language="${LOCALE}">Je n'ai pas entendu. Au revoir.</Say>
+    <Hangup/>
+  `);
+
+  res.type("text/xml").send(xml);
 });
 
-app.listen(PORT, () => console.log(`✅ Voice AI live on ${PORT}`));
+// ───────────────────────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+  console.log(`✅ Voice AI conversationnel live on ${PORT}`);
+});
