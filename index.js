@@ -12,6 +12,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const LOCALE = process.env.LOCALE || "fr-FR";
 const SMS_FROM = process.env.TWILIO_SMS_FROM;
+const BASE = process.env.PUBLIC_BASE_URL?.replace(/\/$/, ""); // ex: https://twilio-voice-test-xxxxx.onrender.com
 
 // Twilio poste en x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
@@ -23,19 +24,25 @@ app.get("/", (req, res) => res.send("✅ Voice AI server running"));
 
 // 1) Entrée d'appel : on donne la consigne et on enregistre
 app.all("/voice", (req, res) => {
+  console.log("📞 /voice hit. From:", req.body?.From);
+  if (!BASE) console.warn("⚠️ PUBLIC_BASE_URL manquant : ajoute-le dans Render !");
+  const thanksUrl = `${BASE}/thanks`;
+  const recCbUrl  = `${BASE}/recording-done`;
+
   res.type("text/xml").send(
     twiml(`
       <Say voice="alice" language="${LOCALE}">
-        Bienvenue. Après le bip, dictez votre commande (par exemple : 
+        Bienvenue. Après le bip, dictez votre commande (par exemple :
         "Deux tacos bœuf, une pizza 4 fromages, et un coca zéro").
         Appuyez sur dièse pour terminer.
       </Say>
-      <Record 
-        playBeep="true" 
+      <Record
+        playBeep="true"
         finishOnKey="#"
         maxLength="90"
-        action="/thanks"
-        recordingStatusCallback="/recording-done"
+        action="${thanksUrl}"
+        method="POST"
+        recordingStatusCallback="${recCbUrl}"
         recordingStatusCallbackMethod="POST"
       />
       <Say voice="alice" language="${LOCALE}">Je n'ai rien reçu.</Say>
@@ -46,6 +53,7 @@ app.all("/voice", (req, res) => {
 
 // 2) On remercie immédiatement l'appelant (réponse rapide TwiML)
 app.post("/thanks", (req, res) => {
+  console.log("🙏 /thanks hit. From:", req.body?.From, "RecordingUrl:", req.body?.RecordingUrl);
   res.type("text/xml").send(
     twiml(`
       <Say voice="alice" language="${LOCALE}">
@@ -61,10 +69,31 @@ app.post("/recording-done", async (req, res) => {
   // Toujours répondre vite à Twilio
   res.status(200).send("OK");
 
+  const from = req.body?.From;
+  const recUrlBase = req.body?.RecordingUrl;
+  const recUrl = recUrlBase ? `${recUrlBase}.mp3` : null;
+
+  console.log("🎧 /recording-done hit. From:", from, "RecordingUrl:", recUrlBase);
+
+  // Si quoi que ce soit cloche, on envoie quand même un SMS générique
+  async function safeSms(body) {
+    if (!SMS_FROM || !from) {
+      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)", { SMS_FROM, from });
+      return;
+    }
+    try {
+      const msg = await client.messages.create({ from: SMS_FROM, to: from, body });
+      console.log("📩 SMS envoyé:", msg.sid);
+    } catch (e) {
+      console.error("❌ Erreur envoi SMS:", e?.message || e);
+    }
+  }
+
   try {
-    const from = req.body.From;                       // numéro de l’appelant (E.164)
-    const recUrlBase = req.body.RecordingUrl;         // ex: https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RE....
-    const recUrl = `${recUrlBase}.mp3`;               // on récupère en MP3
+    if (!recUrl) {
+      await safeSms("Nous avons bien reçu votre appel. Impossible de récupérer l’enregistrement, nous vous recontacterons si besoin.");
+      return;
+    }
 
     // 3a) Télécharger l'audio de Twilio (avec auth SID/TOKEN)
     const audioResponse = await axios.get(recUrl, {
@@ -76,17 +105,22 @@ app.post("/recording-done", async (req, res) => {
     });
 
     // 3b) Transcription Whisper
-    const transcription = await openai.audio.transcriptions.create({
-      file: audioResponse.data,
-      model: "whisper-1",
-      // language: "fr" // facultatif : Whisper auto-détecte très bien le FR
-    });
-
-    const text = (transcription?.text || "").trim();
+    let text = "";
+    try {
+      const transcription = await openai.audio.transcriptions.create({
+        file: audioResponse.data, // Readable stream
+        model: "whisper-1",
+      });
+      text = (transcription?.text || "").trim();
+    } catch (err) {
+      console.error("❌ Erreur Whisper:", err?.response?.data || err.message);
+    }
     console.log("📝 Transcription =", text);
 
-    // 3c) Extraction structurée de la commande avec GPT
-    const system = `Tu es un assistant de prise de commande de restauration rapide.
+    // 3c) Extraction structurée avec GPT (si on a du texte)
+    let smsBody = "";
+    if (text) {
+      const system = `Tu es un assistant de prise de commande de restauration rapide.
 Retourne STRICTEMENT un JSON valide, sans texte autour, suivant ce schéma :
 {
   "items":[{"name":"string","quantity":number,"notes":"string"}],
@@ -96,50 +130,44 @@ Retourne STRICTEMENT un JSON valide, sans texte autour, suivant ce schéma :
 - Déduis la quantité si elle n'est pas dite explicitement (par défaut 1).
 - "notes" peut être vide si aucune précision.`;
 
-    const user = `Transcript client (français) : """${text}"""`;
+      const user = `Transcript client (français) : """${text}"""`;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.2,
-      max_completion_tokens: 400,
-    });
+      let parsed = null;
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          response_format: { type: "json_object" },
+          temperature: 0.2,
+          max_completion_tokens: 400,
+        });
+        parsed = JSON.parse(completion.choices[0].message.content);
+      } catch (err) {
+        console.error("❌ Erreur parsing JSON GPT:", err?.message || err);
+      }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(completion.choices[0].message.content);
-    } catch {
-      parsed = { items: [], intent: "order", summary: text || "Commande non comprise" };
-    }
-
-    // Construire un résumé lisible pour SMS
-    const lines = (parsed.items || []).map(
-      (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " (" + it.notes + ")" : ""}`
-    );
-    const smsBody =
-      lines.length > 0
-        ? `Récapitulatif de votre commande :\n${lines.join("\n")}\n\n${parsed.summary || ""}`
-        : `Nous avons bien reçu votre message :\n"${text}"\n(Nous reviendrons vers vous si besoin)`;
-
-    // 3d) Envoyer le SMS au client
-    if (SMS_FROM && from) {
-      await client.messages.create({
-        from: SMS_FROM,
-        to: from,
-        body: smsBody,
-      });
-      console.log("📩 SMS envoyé à", from);
+      if (parsed?.items?.length) {
+        const lines = parsed.items.map(
+          (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " (" + it.notes + ")" : ""}`
+        );
+        smsBody = `Récapitulatif de votre commande :\n${lines.join("\n")}\n\n${parsed.summary || ""}`;
+      } else {
+        smsBody = `Nous avons bien reçu votre message :\n"${text}"\n(Nous reviendrons vers vous si besoin)`;
+      }
     } else {
-      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)");
+      smsBody = "Nous avons bien reçu votre appel, mais la transcription a échoué. Nous vous recontacterons si besoin.";
     }
+
+    // 3d) Envoi SMS (toujours)
+    await safeSms(smsBody);
+
   } catch (err) {
     console.error("❌ Erreur traitement callback:", err?.response?.data || err.message);
+    await safeSms("Nous avons bien reçu votre appel. Un incident technique est survenu pendant le traitement.");
   }
 });
 
 app.listen(PORT, () => console.log(`✅ Voice AI live on ${PORT}`));
-
