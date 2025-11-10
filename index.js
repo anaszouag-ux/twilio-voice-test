@@ -1,98 +1,106 @@
-// index.js — Flux 100% Twilio : prise de commande vocale + SMS récap, sans OpenAI
+// index.js — Twilio <Stream> -> WebSocket /realtime (base de la conversation temps réel)
 
 import express from "express";
-import Twilio from "twilio";
+import { WebSocketServer } from "ws";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ENV attendus : TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM, LOCALE (facultatif)
-const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const LOCALE = process.env.LOCALE || "fr-FR";
-const SMS_FROM = process.env.TWILIO_SMS_FROM;
-
-// Twilio envoie les webhooks en x-www-form-urlencoded
+// Twilio envoie en x-www-form-urlencoded sur /voice (webhook)
 app.use(express.urlencoded({ extended: false }));
 
-const twiml = (xml) => `<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`;
+// Petit helper TwiML
+const twiml = (body) => `<?xml version="1.0" encoding="UTF-8"?><Response>${body}</Response>`;
 
-app.get("/", (req, res) => res.send("✅ Voice AI (Twilio-only) running"));
+// Santé
+app.get("/", (_req, res) => res.send("✅ Voice streaming server running"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
- * 1) Accueil + <Gather input="speech"> pour capter la commande
- * - Twilio fera la STT côté plate-forme et renverra SpeechResult à /process
+ * 1) Webhook Twilio « A call comes in »
+ *    -> on lui répond avec une <Connect><Stream> vers notre WebSocket /realtime
  */
-app.all("/voice", (req, res) => {
+app.post("/voice", (req, res) => {
+  // Si tu renseignes PUBLIC_BASE_URL=https://ton-app.onrender.com dans Render,
+  // on l'utilise pour construire l'URL WSS. Sinon on prend l'host de la requête.
+  const hostBase =
+    process.env.PUBLIC_BASE_URL && process.env.PUBLIC_BASE_URL.startsWith("http")
+      ? process.env.PUBLIC_BASE_URL
+      : `https://${req.get("host")}`;
+
+  const wsUrl = hostBase.replace(/^http/, "ws") + "/realtime";
+
   res.type("text/xml").send(
     twiml(`
-      <Gather input="speech"
-              language="${LOCALE}"
-              speechTimeout="auto"
-              action="/process"
-              method="POST">
-        <Say voice="alice" language="${LOCALE}">
-          Bonjour ! Dites votre commande après le bip. 
-          Par exemple : deux tacos bœuf, une pizza quatre fromages, et un coca zéro.
-          Quand vous avez terminé, dites simplement "c'est tout".
-        </Say>
-        <Pause length="1"/>
-      </Gather>
-      <Say voice="alice" language="${LOCALE}">
-        Pardon, je n'ai rien entendu. Je vous invite à rappeler.
-      </Say>
-      <Hangup/>
+      <Say language="fr-FR">Un instant, je vous mets en relation avec notre assistant.</Say>
+      <Connect>
+        <Stream url="${wsUrl}" />
+      </Connect>
     `)
   );
 });
 
 /**
- * 2) Réception du résultat STT de Twilio -> SMS au client et confirmation vocale
+ * 2) Serveur HTTP + WebSocket /realtime
+ *    Twilio se connecte ici et envoie les événements:
+ *    - "start" (infos appel)
+ *    - "media" (trames audio base64, 20 ms)
+ *    - "stop" (fin du flux)
+ *
+ *    Pour le moment, on logge tout. Ensuite on branchera GPT-5 Realtime ici.
  */
-app.post("/process", async (req, res) => {
-  const speech = (req.body.SpeechResult || "").trim();
-  const from = req.body.From;
+const server = app.listen(PORT, () =>
+  console.log(`✅ Voice streaming server listening on ${PORT}`)
+);
 
-  // Si Twilio n'a rien compris, on redemande une fois
-  if (!speech) {
-    return res.type("text/xml").send(
-      twiml(`
-        <Say voice="alice" language="${LOCALE}">
-          Désolé, je n'ai pas compris. Pouvez-vous répéter votre commande ?
-        </Say>
-        <Redirect method="POST">/voice</Redirect>
-      `)
-    );
-  }
+const wss = new WebSocketServer({ server, path: "/realtime" });
 
-  // Message SMS à envoyer au client
-  const smsBody =
-    `Récap de votre commande :\n` +
-    `"${speech}"\n\n` +
-    `Si c'est correct, aucun retour n'est nécessaire. Merci !`;
+wss.on("connection", (socket) => {
+  console.log("🔊 Twilio stream connected");
 
-  // On tente d'envoyer le SMS (si la config SMS est OK)
-  try {
-    if (SMS_FROM && from) {
-      await client.messages.create({ from: SMS_FROM, to: from, body: smsBody });
-      console.log("📩 SMS envoyé à", from, "=>", smsBody);
-    } else {
-      console.warn("⚠️ SMS non envoyé (TWILIO_SMS_FROM ou From manquant)");
+  let streamSid = null;
+  let packets = 0;
+
+  socket.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+
+      switch (data.event) {
+        case "start":
+          streamSid = data.start?.streamSid || null;
+          console.log("▶️  start:", { streamSid, from: data.start?.from, to: data.start?.to });
+          break;
+
+        case "media":
+          // data.media.payload contient l'audio (base64, PCM 8k mono 16-bit)
+          packets += 1;
+          if (packets % 50 === 0) {
+            console.log(`🎧 media packets: ${packets} (streamSid=${streamSid || "?"})`);
+          }
+          // ICI plus tard: envoyer ces trames vers GPT-5 Realtime et renvoyer l'audio généré vers Twilio
+          break;
+
+        case "stop":
+          console.log("⏹️  stop:", { streamSid });
+          break;
+
+        default:
+          console.log("ℹ️  event:", data.event);
+      }
+    } catch (e) {
+      console.error("⚠️ WS parse error:", e.message);
     }
-  } catch (e) {
-    console.error("❌ Erreur envoi SMS:", e?.message || e);
-  }
+  });
 
-  // Confirmation à l'appelant + on répète ce qu'on a compris
-  res.type("text/xml").send(
-    twiml(`
-      <Say voice="alice" language="${LOCALE}">
-        Merci. J'ai bien noté : ${speech}.
-        Vous allez recevoir un SMS récapitulatif.
-        Bonne journée !
-      </Say>
-      <Hangup/>
-    `)
-  );
+  socket.on("close", () => {
+    console.log("❌ Twilio stream closed");
+  });
+
+  // (optionnel) ping pour garder la connexion en vie
+  const pingIv = setInterval(() => {
+    if (socket.readyState === socket.OPEN) socket.ping();
+  }, 15000);
+
+  socket.on("pong", () => { /* ok */ });
+  socket.on("close", () => clearInterval(pingIv));
 });
-
-app.listen(PORT, () => console.log(`✅ Voice AI (Twilio-only) live on ${PORT}`));
