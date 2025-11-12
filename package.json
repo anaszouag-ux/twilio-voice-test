@@ -1,16 +1,16 @@
 {
-  "name": "twilio-voice-ai",
+  "name": "twilio-voice-ai-noopenai",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "twilio": "^4.21.0"
   }
 }
