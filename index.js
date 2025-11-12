@@ -1,220 +1,184 @@
-// index.js — Twilio <Stream> ⇄ OpenAI Realtime (full-duplex, robuste)
-
+// Voice ordering (no OpenAI) — Twilio Speech-to-Text + simple parser + SMS
 import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
-import WebSocket from "ws";
+import Twilio from "twilio";
 
-/* ====== ENV ====== */
-const PORT = process.env.PORT || 5000;
-const BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, ""); // ex: https://xxx.onrender.com
-const LOCALE = process.env.LOCALE || "fr-FR";
-const VOICE = process.env.VOICE || "alloy";
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-5-realtime-preview";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-if (!BASE_URL) console.warn("⚠️ PUBLIC_BASE_URL manquant (ajoute-le dans Render → Environment)");
-if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquant (aucune réponse IA possible)");
-console.log("ℹ️ Config:", { BASE_URL, LOCALE, VOICE, REALTIME_MODEL });
-
-/* ====== µ-law / PCM helpers ====== */
-// µ-law decode (-> Int16 sample)
-function muLawDecode(sample) {
-  sample = ~sample & 0xff;
-  const sign = (sample & 0x80) ? -1 : 1;
-  const exponent = (sample >> 4) & 0x07;
-  const mantissa = sample & 0x0f;
-  const magnitude = ((mantissa << 4) + 0x08) << (exponent + 3);
-  return sign * magnitude;
-}
-// base64 µ-law -> Int16Array (8kHz)
-function decodeMuLawBase64ToInt16(base64) {
-  const ulaw = Buffer.from(base64, "base64");
-  const pcm = new Int16Array(ulaw.length);
-  for (let i = 0; i < ulaw.length; i++) pcm[i] = muLawDecode(ulaw[i]);
-  return pcm;
-}
-// simple upsample 8k -> 16k (duplication)
-function upsample8kTo16k(int16_8k) {
-  const out = new Int16Array(int16_8k.length * 2);
-  for (let i = 0; i < int16_8k.length; i++) {
-    out[2 * i] = int16_8k[i];
-    out[2 * i + 1] = int16_8k[i];
-  }
-  return out;
-}
-// PCM16 -> µ-law (un sample)
-function linearToMuLaw(sample) {
-  const CLIP = 32635;
-  let sign = (sample >> 8) & 0x80;
-  if (sign !== 0) sample = -sample;
-  if (sample > CLIP) sample = CLIP;
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
-  return (~(sign | (exponent << 4) | mantissa)) & 0xff;
-}
-// Int16Array 16k -> base64 µ-law 8k (downsample x2)
-function pcm16_16k_ToMuLawBase64(int16_16k) {
-  const len8k = Math.floor(int16_16k.length / 2);
-  const ulaw = Buffer.alloc(len8k);
-  for (let i = 0; i < len8k; i++) {
-    const s = int16_16k[i * 2];
-    ulaw[i] = linearToMuLaw(s);
-  }
-  return ulaw.toString("base64");
-}
-
-/* ====== App HTTP ====== */
 const app = express();
+const PORT = process.env.PORT || 5000;
+
+// ====== ENV ======
+const LOCALE = process.env.LOCALE || "fr-FR"; // ex: fr-FR
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_SMS_FROM    = process.env.TWILIO_SMS_FROM;
+
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_SMS_FROM) {
+  console.warn("⚠️ Missing Twilio ENV vars. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM");
+}
+
+const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// Twilio envoie du x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-// Health
-app.get("/", (_, res) => res.send("✅ Realtime voice bridge is up"));
+// Petit helper TwiML
+const twiml = (xml) => `<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`;
 
-// TwiML: connecte l'appel à notre WebSocket /stream
-app.all("/voice", (req, res) => {
-  const wsUrl = `${BASE_URL.replace(/^http/, "ws")}/stream`;
-  const xml = `
-    <?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-      <Say voice="alice" language="${LOCALE}">Bonjour, je vous écoute. Parlez naturellement s'il vous plaît.</Say>
-      <Connect>
-        <Stream url="${wsUrl}" track="both_tracks" />
-      </Connect>
-    </Response>
-  `.trim();
-  res.type("text/xml").send(xml);
-});
+// ====== Menu basique (à personnaliser) ======
+const MENU = [
+  "pizza", "tacos", "kebab", "burger", "sandwich",
+  "wrap", "salade", "frites", "nuggets", "sushi",
+  "boisson", "coca", "coca zéro", "eau", "jus"
+];
 
-/* ====== HTTP + WS server ====== */
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/stream" });
+// chiffres FR -> nombre
+const FR_NUM = {
+  "un":1, "une":1, "deux":2, "trois":3, "quatre":4, "cinq":5,
+  "six":6, "sept":7, "huit":8, "neuf":9, "dix":10, "onze":11, "douze":12
+};
 
-/* ====== Bridge Twilio <-> OpenAI Realtime ====== */
-wss.on("connection", (twilioWS) => {
-  console.log("🔌 Twilio stream connected");
+// ====== Parser très simple ======
+function parseOrder(text) {
+  if (!text) return { items: [], notes: "" };
 
-  // Ouvre le WS Realtime OpenAI
-  const openaiWS = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY || ""}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
+  const lower = text.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu,"");
+  const tokens = lower.split(/\s+/);
 
-  let openaiReady = false;
+  // repérer quantités ("2", "deux") + items du MENU
+  const items = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tk = tokens[i];
+    let qty = 1;
 
-  openaiWS.on("open", () => {
-    openaiReady = true;
-    console.log("🧠 OpenAI Realtime connected");
+    // nombre en chiffre
+    if (/^\d+$/.test(tk)) qty = parseInt(tk, 10);
 
-    // Configure la session
-    openaiWS.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        voice: VOICE,
-        input_audio_format: { type: "pcm16", sample_rate_hz: 16000 },
-        output_audio_format: { type: "pcm16", sample_rate_hz: 16000 },
-        instructions:
-          `Tu es un assistant de prise de commande pour un restaurant rapide. 
-           Parle ${LOCALE}. Réponds vite, poliment, brièvement.
-           Interromps-toi si l'utilisateur parle (barge-in implicite).
-           Reformule et confirme les éléments de commande.`
-      }
-    }));
+    // nombre en lettres FR
+    if (FR_NUM[tk] !== undefined) qty = FR_NUM[tk];
 
-    // Premier message (évite le blanc)
-    openaiWS.send(JSON.stringify({
-      type: "response.create",
-      response: { modalities: ["audio"], instructions: "Bonjour ! Que puis-je vous préparer aujourd’hui ?" }
-    }));
-  });
-
-  openaiWS.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-
-      // Audio sortant de l'IA (PCM16 16k base64) -> μ-law 8k -> Twilio
-      if (msg.type === "response.output_audio.delta" && msg.delta) {
-        const raw = Buffer.from(msg.delta, "base64");
-        const int16 = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2);
-        const ulawB64 = pcm16_16k_ToMuLawBase64(int16);
-
-        const media = { event: "media", media: { payload: ulawB64 } };
-        try { twilioWS.readyState === 1 && twilioWS.send(JSON.stringify(media)); } catch {}
-      }
-
-      // (debug texte facultatif)
-      if (msg.type === "response.output_text.delta") process.stdout.write(msg.delta);
-      if (msg.type === "response.completed") process.stdout.write("\n");
-
-    } catch (e) {
-      console.warn("OpenAI msg parse error:", e.message);
-    }
-  });
-
-  openaiWS.on("error", (e) => console.error("❌ OpenAI WS error:", e.message));
-  openaiWS.on("close", () => console.log("🧠 OpenAI WS closed"));
-
-  // Audio entrant Twilio -> OpenAI
-  twilioWS.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (!openaiReady) return;
-
-      switch (msg.event) {
-        case "start":
-          console.log("▶️  Twilio start:", msg.start?.streamSid, msg.start?.mediaFormat);
-          break;
-
-        case "media": {
-          // Twilio -> μ-law 8k base64 -> Int16 -> upsample 16k -> base64 PCM16
-          const pcm8k = decodeMuLawBase64ToInt16(msg.media.payload);
-          const pcm16k = upsample8kTo16k(pcm8k);
-          const base64Pcm16 = Buffer.from(pcm16k.buffer).toString("base64");
-
-          // Push audio dans le buffer d'entrée
-          openaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: base64Pcm16 }));
-          // Commit ce chunk et demande une réponse (modale audio)
-          openaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          openaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+    // regarder l’item juste après ou le même token
+    // cas 1: "deux pizzas"
+    if (i+1 < tokens.length) {
+      const next = tokens[i+1];
+      const candidate = [tk, next, `${tk} ${next}`]; // simple essais
+      for (const c of candidate) {
+        const hit = MENU.find(m => c.includes(m));
+        if (hit) {
+          items.push({ name: hit, quantity: qty });
+          i++; // on saute le token suivant supposé être l'item
           break;
         }
-
-        case "stop":
-          console.log("⏹️  Twilio stop");
-          try { openaiWS.close(); } catch {}
-          break;
-
-        default:
-          // mark, clear, etc.
-          break;
       }
-    } catch (e) {
-      console.warn("Twilio msg parse error:", e.message);
     }
-  });
 
-  // Keepalive pour éviter la coupure idle
-  const pingIv = setInterval(() => {
-    if (twilioWS.readyState === 1) twilioWS.ping();
-  }, 15000);
+    // cas 2: "pizza", sans quantité explicite avant
+    const direct = MENU.find(m => tk.includes(m));
+    if (direct) {
+      items.push({ name: direct, quantity: qty });
+    }
+  }
 
-  twilioWS.on("close", () => {
-    console.log("🔌 Twilio WS closed");
-    clearInterval(pingIv);
-    try { openaiWS.close(); } catch {}
-  });
+  // notes très basiques (tout ce qui suit "sans" / "avec")
+  let notes = "";
+  const sansIdx = tokens.indexOf("sans");
+  if (sansIdx >= 0) notes += "sans " + tokens.slice(sansIdx+1, sansIdx+4).join(" ");
+  const avecIdx = tokens.indexOf("avec");
+  if (avecIdx >= 0) {
+    if (notes) notes += " | ";
+    notes += "avec " + tokens.slice(avecIdx+1, avecIdx+4).join(" ");
+  }
 
-  twilioWS.on("error", (err) => console.error("❌ Twilio WS error:", err.message));
+  // fusionner items identiques
+  const merged = [];
+  for (const it of items) {
+    const found = merged.find(x => x.name === it.name);
+    if (found) found.quantity += it.quantity || 1;
+    else merged.push({ name: it.name, quantity: it.quantity || 1 });
+  }
+
+  return { items: merged, notes: notes.trim() };
+}
+
+// ====== ENDPOINTS ======
+
+// 1) Accueil d’appel : reconnaissance vocale avec Gather
+app.all("/voice", (req, res) => {
+  const twimlXml = twiml(`
+    <Gather input="speech"
+            language="${LOCALE}"
+            speechTimeout="auto"
+            hintTimeoutMs="12000"
+            action="/process"
+            method="POST">
+      <Say voice="alice" language="${LOCALE}">
+        Bonjour ! Dites votre commande naturellement. Par exemple : 
+        "Deux tacos boeuf, une pizza quatre fromages et un coca zéro".
+        Quand vous avez terminé, restez silencieux quelques secondes.
+      </Say>
+    </Gather>
+    <Say voice="alice" language="${LOCALE}">
+      Désolé, je n'ai rien entendu. Rappelez si besoin.
+    </Say>
+    <Hangup/>
+  `.trim());
+
+  res.type("text/xml").send(twimlXml);
 });
 
-/* ====== Start ====== */
-server.listen(PORT, () => {
-  console.log(`✅ Realtime voice bridge listening on ${PORT}`);
-  console.log(`🌐 Base URL: ${BASE_URL || "(unset)"} | WS path: /stream`);
+// 2) Réception du résultat speech -> parsing -> SMS -> confirmation
+app.post("/process", async (req, res) => {
+  try {
+    const from = req.body.From;             // numéro appelant (E.164)
+    const transcript = (req.body.SpeechResult || "").trim();
+
+    console.log("🎤 Transcription:", transcript || "<vide>");
+
+    const parsed = parseOrder(transcript);
+    const lines = parsed.items.map(it => `• ${it.quantity} x ${it.name}`);
+    let smsBody = "";
+
+    if (lines.length > 0) {
+      smsBody = `Récapitulatif de votre commande:\n${lines.join("\n")}`;
+      if (parsed.notes) smsBody += `\nNotes: ${parsed.notes}`;
+    } else {
+      smsBody = `Message reçu:\n"${transcript || "—"}"\n(aucun article reconnu)`;
+    }
+
+    // SMS à l’appelant
+    if (from) {
+      await client.messages.create({
+        from: TWILIO_SMS_FROM,
+        to: from,
+        body: smsBody,
+      });
+      console.log("📩 SMS envoyé à", from);
+    } else {
+      console.warn("⚠️ From manquant. SMS non envoyé.");
+    }
+
+    // Réponse vocale
+    const voiceConfirm = lines.length
+      ? `Merci ! Je vous ai envoyé votre récapitulatif par SMS.`
+      : `Merci ! J'ai reçu votre message.`;
+
+    const twimlXml = twiml(`
+      <Say voice="alice" language="${LOCALE}">${voiceConfirm}</Say>
+      <Hangup/>
+    `.trim());
+
+    res.type("text/xml").send(twimlXml);
+  } catch (err) {
+    console.error("❌ /process error:", err.message);
+    res.type("text/xml").send(
+      twiml(`<Say voice="alice" language="${LOCALE}">Désolé, une erreur est survenue.</Say><Hangup/>`)
+    );
+  }
+});
+
+// 3) Healthcheck simple
+app.get("/", (req, res) => {
+  res.send("✅ Voice order (no-OpenAI) is running!");
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Server on : ${PORT}`);
 });
