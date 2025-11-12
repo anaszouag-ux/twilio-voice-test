@@ -1,5 +1,5 @@
 {
-  "name": "twilio-voice-ai-noopenai",
+  "name": "twilio-voice-chatgpt",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
+    "openai": "^4.56.0",
     "twilio": "^4.21.0"
   }
 }
