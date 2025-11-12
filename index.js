@@ -86,7 +86,7 @@ app.use(express.json());
 
 // TwiML qui ouvre le flux bidirectionnel vers /realtime
 app.all("/voice", (req, res) => {
-  const wsUrl = `${BASE_URL.replace(/^http/, "ws")}/realtime`;
+  const wsUrl = `${BASE_URL.replace(/^http/, "ws")}/stream`;
   const twiml = `
     <?xml version="1.0" encoding="UTF-8"?>
     <Response>
@@ -242,3 +242,4 @@ wss.on("connection", async (twilioWs) => {
 server.listen(PORT, () => {
   console.log(`✅ Realtime voice bridge listening on ${PORT}`);
 });
+
