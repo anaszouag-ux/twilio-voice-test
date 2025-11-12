@@ -1,123 +1,96 @@
-// Voice order with ChatGPT NLU (no realtime). Twilio STT -> OpenAI JSON -> SMS
+// Minimal ChatGPT test on Render
 import express from "express";
-import Twilio from "twilio";
 import OpenAI from "openai";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ===== ENV =====
-const LOCALE = process.env.LOCALE || "fr-FR";               // ex: fr-FR
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;          // sk-...
-const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// --- ENV ---
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_SMS_FROM    = process.env.TWILIO_SMS_FROM;     // +33...
-
-if (!OPENAI_API_KEY) console.warn("⚠️ Missing OPENAI_API_KEY");
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_SMS_FROM) {
-  console.warn("⚠️ Missing Twilio vars (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM)");
+if (!OPENAI_API_KEY) {
+  console.warn("⚠️ OPENAI_API_KEY manquante ! Ajoute-la dans Render → Environment");
 }
 
-const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Twilio envoie x-www-form-urlencoded
+// Parse forms & JSON
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-const twiml = (xml) => `<?xml version="1.0" encoding="UTF-8"?><Response>${xml}</Response>`;
-
-// ===== 1) Entrée d’appel : Gather (STT Twilio) =====
-app.all("/voice", (req, res) => {
-  const xml = twiml(`
-    <Gather input="speech"
-            language="${LOCALE}"
-            speechTimeout="auto"
-            action="/process"
-            method="POST">
-      <Say voice="alice" language="${LOCALE}">
-        Bonjour ! Dites votre commande naturellement. Par exemple :
-        "Deux tacos boeuf, une pizza quatre fromages et un coca zéro".
-        Quand vous avez fini, restez silencieux quelques secondes.
-      </Say>
-    </Gather>
-    <Say voice="alice" language="${LOCALE}">
-      Je n'ai rien entendu. N'hésitez pas à rappeler.
-    </Say>
-    <Hangup/>
+// Page de test simple (formulaire)
+app.get("/", (_req, res) => {
+  res.type("html").send(`
+    <!doctype html>
+    <html lang="fr">
+      <head><meta charset="utf-8"><title>Test ChatGPT</title></head>
+      <body style="font-family:sans-serif;max-width:720px;margin:40px auto">
+        <h1>Test ChatGPT (Render ➜ OpenAI)</h1>
+        <form method="POST" action="/ask">
+          <label>Votre question :</label><br/>
+          <textarea name="prompt" rows="4" style="width:100%;font-size:16px" placeholder="Pose une question..."></textarea>
+          <br/><br/>
+          <button type="submit" style="padding:10px 16px;font-size:16px">Envoyer</button>
+        </form>
+        <p style="color:#555">Modèle utilisé : <code>${OPENAI_MODEL}</code></p>
+        <p>Endpoint API dispo : <code>POST /ask</code> (JSON: { "prompt": "..." })</p>
+      </body>
+    </html>
   `);
-  res.type("text/xml").send(xml);
 });
 
-// ===== 2) Traitement : SpeechResult -> OpenAI -> SMS -> confirmation =====
-app.post("/process", async (req, res) => {
-  const from = req.body.From;
-  const transcript = (req.body.SpeechResult || "").trim();
-
-  console.log("🎤 Transcript:", transcript || "<vide>");
-
-  // Réponse Twilio immédiate pour l’appelant
-  const ack = twiml(`
-    <Say voice="alice" language="${LOCALE}">
-      Merci, je traite votre commande et je vous envoie un SMS récapitulatif.
-    </Say>
-    <Hangup/>
-  `);
-  res.type("text/xml").send(ack);
-
+// Endpoint: appelle OpenAI et renvoie la réponse
+app.post("/ask", async (req, res) => {
   try {
-    // Appel OpenAI pour structurer la commande
-    const system = `Tu es un assistant de restauration.
-Retourne STRICTEMENT un JSON valide (pas de texte autour) selon ce schéma:
-{
-  "items":[{"name":"string","quantity":number,"notes":"string"}],
-  "summary":"string courte en français"
-}
-- Déduis la quantité si absente (par défaut 1).
-- "notes" peut être vide.
-- Concentre-toi sur les aliments/boissons.`;
+    const prompt = (req.body.prompt || "").toString().trim();
+    if (!prompt) {
+      return res.status(400).json({ error: "prompt manquant" });
+    }
 
-    const user = `Transcription client (français): """${transcript}"""`;
+    console.log("🧠 Appel OpenAI…", { model: OPENAI_MODEL, prompt: prompt.slice(0, 80) });
 
     const completion = await openai.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
+        { role: "system", content: "Tu es un assistant bref et utile. Réponds en français." },
+        { role: "user", content: prompt }
       ],
-      response_format: { type: "json_object" },
-      temperature: 0.2,
-      max_completion_tokens: 400
+      temperature: 0.6,
+      max_completion_tokens: 300
     });
 
-    let parsed;
-    try {
-      parsed = JSON.parse(completion.choices[0].message.content);
-    } catch {
-      parsed = { items: [], summary: transcript || "" };
+    const text = completion.choices?.[0]?.message?.content ?? "";
+    console.log("✅ Réponse OpenAI OK (longueur:", text.length, ")");
+
+    // Si la requête vient du formulaire HTML, renvoyer une page lisible
+    if (req.headers["content-type"]?.includes("application/x-www-form-urlencoded")) {
+      return res.type("html").send(`
+        <pre style="white-space:pre-wrap;font-family:ui-monospace,monospace">${escapeHtml(text)}</pre>
+        <p><a href="/">← Retour</a></p>
+      `);
     }
 
-    const lines = (parsed.items || []).map(
-      (it) => `• ${it.quantity || 1} x ${it.name}${it.notes ? " ("+it.notes+")" : ""}`
-    );
+    // Sinon, renvoyer en JSON
+    res.json({ ok: true, model: OPENAI_MODEL, prompt, answer: text });
 
-    const smsBody = lines.length
-      ? `Récapitulatif de votre commande:\n${lines.join("\n")}\n\n${parsed.summary || ""}`
-      : `Message reçu:\n"${transcript || "—"}"\n(Aucun article reconnu)`;
-
-    if (from) {
-      await client.messages.create({ from: TWILIO_SMS_FROM, to: from, body: smsBody });
-      console.log("📩 SMS envoyé à", from);
-    }
   } catch (err) {
-    console.error("❌ OpenAI/Traitement error:", err?.response?.data || err.message);
-    // Pas de renvoi TwiML ici : on a déjà répondu
+    console.error("❌ Erreur OpenAI:", err?.response?.data || err.message);
+    res.status(500).json({ ok: false, error: "OpenAI error", detail: err.message });
   }
 });
 
 // Health
-app.get("/", (_, res) => res.send("✅ Voice+ChatGPT order is running"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => console.log(`✅ Server on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Minimal ChatGPT server on ${PORT}`);
+});
 
+// Petite fonction pour échapper le HTML
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
