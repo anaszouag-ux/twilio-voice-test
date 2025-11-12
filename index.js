@@ -1,6 +1,5 @@
 // Minimal Realtime test (browser ↔ OpenAI Realtime via WebRTC)
-// Server creates an ephemeral client token; browser talks directly to OpenAI.
-// ENV needed: OPENAI_API_KEY, OPENAI_REALTIME_MODEL (ex: gpt-4o-realtime-preview), VOICE (ex: alloy)
+// ENV: OPENAI_API_KEY, OPENAI_REALTIME_MODEL (ex: gpt-4o-realtime-preview), VOICE (ex: alloy)
 
 import express from "express";
 import cors from "cors";
@@ -8,21 +7,21 @@ import cors from "cors";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const REALTIME_MODEL =
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 const VOICE = process.env.VOICE || "alloy";
 
 if (!OPENAI_API_KEY) {
-  console.warn("⚠️ OPENAI_API_KEY manquante. Ajoute-la dans Render → Environment.");
+  console.warn("⚠️  OPENAI_API_KEY manquante (Render → Environment).");
 }
 
 app.use(cors());
 app.use(express.json());
 
-// Minimal home page (client)
+// Page client
 app.get("/", (_req, res) => {
-  res.type("html").send(`
-<!doctype html>
+  res.type("html").send(`<!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
@@ -41,108 +40,95 @@ app.get("/", (_req, res) => {
   <pre id="log"></pre>
   <script>
     const logEl = document.getElementById('log');
-    function log(...args){ logEl.textContent += args.join(' ') + "\\n"; }
+    function log(){ logEl.textContent += Array.from(arguments).join(' ') + "\\n"; }
 
     async function getEphemeralKey(){
-      const r = await fetch('/session', {method:'POST'});
+      const r = await fetch('/session', { method:'POST' });
       if(!r.ok) throw new Error('session failed');
-      return await r.json(); // { client_secret: { value, expires_at }, id, ... }
+      return await r.json(); // { client_secret: { value }, ... }
     }
 
     async function startRealtime(){
-      log('🔐 Requesting ephemeral key…');
-      const session = await getEphemeralKey();
-      const EPHEMERAL = session?.client_secret?.value;
-      if(!EPHEMERAL){ throw new Error('No ephemeral client_secret in response'); }
-      log('✅ Ephemeral key OK (expires soon)');
+      try{
+        log('🔐 Requesting ephemeral key…');
+        const session = await getEphemeralKey();
+        const EPHEMERAL = session?.client_secret?.value;
+        if(!EPHEMERAL) throw new Error('No ephemeral client_secret');
 
-      // Create WebRTC PeerConnection
-      const pc = new RTCPeerConnection();
-      const audioEl = document.getElementById('assistantAudio');
+        const pc = new RTCPeerConnection();
+        const audioEl = document.getElementById('assistantAudio');
 
-      // Play remote audio
-      pc.ontrack = (e) => {
-        audioEl.srcObject = e.streams[0];
-      };
+        pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
 
-      // Data channel for control messages
-      const dc = pc.createDataChannel("oai-events");
-      dc.onopen = () => {
-        log('🔗 DataChannel open');
-        // Ask the assistant to greet in French (first response)
-        dc.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio"],
-            instructions: "Bonjour ! Je suis un test Realtime. Parle-moi naturellement en français."
+        const dc = pc.createDataChannel("oai-events");
+        dc.onopen = () => {
+          log('🔗 DataChannel open');
+          dc.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio"],
+              instructions: "Bonjour ! Je suis un test Realtime. Parle-moi naturellement en français."
+            }
+          }));
+        };
+
+        const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+        ms.getTracks().forEach(t => pc.addTrack(t, ms));
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        log('📡 Sending SDP offer to OpenAI…');
+        const sdpRes = await fetch("https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}", {
+          method: "POST",
+          body: offer.sdp,
+          headers: {
+            "Authorization": "Bearer " + EPHEMERAL,
+            "Content-Type": "application/sdp",
+            "OpenAI-Beta": "realtime=v1"
           }
-        }));
-      };
-      dc.onmessage = (e) => {
-        // Optional debug of events coming from the model
-        // log('📥 DC msg:', e.data);
-      };
+        });
 
-      // Get mic and send to PC
-      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
-      ms.getTracks().forEach(t => pc.addTrack(t, ms));
-
-      // Create and send SDP offer to OpenAI Realtime (with ephemeral token)
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      log('📡 Sending SDP offer to OpenAI…');
-      const sdpResponse = await fetch("https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}", {
-        method: "POST",
-        body: offer.sdp,
-        headers: {
-          "Authorization": "Bearer " + EPHEMERAL,
-          "Content-Type": "application/sdp",
-          "OpenAI-Beta": "realtime=v1"
+        if(!sdpRes.ok){
+          const errTxt = await sdpRes.text();
+          throw new Error("Realtime SDP failed: " + errTxt);
         }
-      });
 
-      if(!sdpResponse.ok){
-        const errTxt = await sdpResponse.text();
-        throw new Error("Realtime SDP failed: " + errTxt);
+        const answer = { type: "answer", sdp: await sdpRes.text() };
+        await pc.setRemoteDescription(answer);
+        log('🧠 Realtime connected. Parle et écoute la réponse.');
+      } catch (e){
+        log('❌ Error:', e.message);
+        console.error(e);
       }
-
-      const answer = { type: "answer", sdp: await sdpResponse.text() };
-      await pc.setRemoteDescription(answer);
-      log('🧠 Realtime connected. Parle et écoute la réponse.');
     }
 
     document.getElementById('startBtn').onclick = () => {
       document.getElementById('startBtn').disabled = true;
-      startRealtime().catch(err => {
-        log('❌ Error:', err.message);
-        console.error(err);
-      });
+      startRealtime();
     };
   </script>
 </body>
-</html>
-  `);
+</html>`);
 });
 
-// Ephemeral session: creates a short-lived client token for the browser
+// Endpoint pour créer une clé éphémère
 app.post("/session", async (_req, res) => {
   try {
     const r = await fetch("https://api.openai.com/v1/realtime/sessions", {
       method: "POST",
       headers: {
-        "Authorization": \`Bearer \${process.env.OPENAI_API_KEY}\`,
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
         "OpenAI-Beta": "realtime=v1"
       },
       body: JSON.stringify({
         model: REALTIME_MODEL,
-        voice: VOICE,              // e.g. "alloy", "aria"…
-        modalities: ["audio"],     // we want audio back
-        // You can tune instructions defaults here:
-        // instructions: "Tu es un assistant bref, poli, en français."
+        voice: VOICE,
+        modalities: ["audio"]
       })
     });
+
     const data = await r.json();
     if (!r.ok) {
       console.error("Realtime session error:", data);
@@ -150,13 +136,15 @@ app.post("/session", async (_req, res) => {
     }
     res.json(data);
   } catch (e) {
-    console.error("Session exception:", e.message);
+    console.error("Session exception:", e);
     res.status(500).json({ error: "session_exception", detail: e.message });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, model: REALTIME_MODEL, voice: VOICE }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, model: REALTIME_MODEL, voice: VOICE })
+);
 
 app.listen(PORT, () => {
-  console.log(\`✅ Realtime minimal server on \${PORT}\`);
+  console.log(`✅ Realtime minimal server on ${PORT}`);
 });
